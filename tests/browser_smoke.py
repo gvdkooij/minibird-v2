@@ -77,6 +77,9 @@ with tempfile.TemporaryDirectory() as tmp:
             page.get_by_role('button',name='Inloggen',exact=True).click()
             assert 'Goed overzicht' in page.inner_text('main')
             assert not errors,errors
+            # Proxy/other software may use the generic cookie name 'session'.
+            # That must never overwrite MiniBird's own authenticated session.
+            page.context.add_cookies([{'name':'session','value':'external-cookie','url':url}])
             # Prove that an unavailable legacy token URL does not masquerade
             # as an expired session. Includes stale forms and confirmation below.
             token_requests=[]
@@ -154,11 +157,18 @@ with tempfile.TemporaryDirectory() as tmp:
             assert 'niet meer ingelogd' not in page.locator('#upload-status').inner_text()
             page.unroute('**/imports/uploads/start',forbidden_api)
             def unauthenticated_api(route):
-                route.fulfill(status=401,content_type='application/json',body='{"detail":"Log eerst in"}')
+                route.fulfill(status=401,content_type='application/json',headers={'X-MiniBird-Response':'1'},body='{"detail":"Log eerst in","code":"MB-AUTH-REQUIRED"}')
             page.route('**/imports/uploads/start',unauthenticated_api)
             page.get_by_role('button',name='Bestand controleren').click()
             expect(page.locator('#upload-status')).to_contain_text('niet meer ingelogd')
             page.unroute('**/imports/uploads/start',unauthenticated_api)
+            def upstream_unauthenticated(route):
+                route.fulfill(status=401,body='Tunnel rejected request')
+            page.route('**/imports/uploads/start',upstream_unauthenticated)
+            page.get_by_role('button',name='Bestand controleren').click()
+            expect(page.locator('#upload-status')).to_contain_text('MB-UPSTREAM-401')
+            assert 'niet meer ingelogd' not in page.locator('#upload-status').inner_text()
+            page.unroute('**/imports/uploads/start',upstream_unauthenticated)
             browser.close()
         print('Browser smoke: setup, settings, customer, multi-line quote, conversion, PDF, payment, responsive dashboard, logout/login, vCard/ZIP import, cross-site session, refreshed CSRF and original PDF PASSED')
     finally:

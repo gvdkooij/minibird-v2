@@ -5,8 +5,19 @@ async function importResponseError(response, fallback) {
   if (location.origin !== window.location.origin) {
     return new Error('GitHub heeft de verbinding naar een andere pagina omgeleid. Open MiniBird opnieuw via de browserlink van je Codespace.');
   }
-  if (response.status === 401 || location.pathname === '/login') {
-    return new Error('Je bent niet meer ingelogd in MiniBird. Log opnieuw in om verder te gaan.');
+  if (response.status === 401) {
+    if (response.headers.get('X-MiniBird-Response') !== '1') {
+      return new Error('De upload wordt geweigerd vóór een herkenbaar antwoord van MiniBird (MB-UPSTREAM-401). Dit bevestigt niet dat je MiniBird-sessie verlopen is. Je bestand blijft geselecteerd.');
+    }
+    const body = await response.json().catch(() => ({}));
+    const codes = ['MB-COOKIE-MISSING', 'MB-COOKIE-INVALID', 'MB-AUTH-REQUIRED'];
+    const code = codes.includes(body.code) ? body.code : 'MB-AUTH-REQUIRED';
+    if (code === 'MB-COOKIE-MISSING') return new Error('De browser stuurde de MiniBird-sessiecookie niet mee (MB-COOKIE-MISSING). Je bestand blijft geselecteerd.');
+    if (code === 'MB-COOKIE-INVALID') return new Error('De MiniBird-sessiecookie wordt niet geaccepteerd (MB-COOKIE-INVALID). Je bestand blijft geselecteerd.');
+    return new Error('Je bent niet meer ingelogd in MiniBird (MB-AUTH-REQUIRED). Je bestand blijft geselecteerd.');
+  }
+  if (location.pathname === '/login') {
+    return new Error('De aanvraag is naar de inlogpagina omgeleid (MB-LOGIN-REDIRECT). Je bestand blijft geselecteerd.');
   }
   let message;
   if ((response.headers.get('content-type') || '').includes('application/json')) {

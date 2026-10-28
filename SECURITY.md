@@ -10,7 +10,7 @@ Reviewed document integrity: transaction-protected unique counters, immutable cu
 
 Reviewed persistence and operations: versioned SQLite initialization, integrity-checked online backup, restore/restart test, default 0600 database permissions. Use a private data directory and unprivileged service with umask 0077. Preserve the encryption/session key outside source control. No public preview, external email, or production financial data was used during validation. HTTPS proxy and local initial setup are mandatory before public use; deployment remains an operator action.
 
-Validation: 50 unit/integration cases and a Chromium workflow, clean installation, pip dependency checks and dependency vulnerability scan. The final dependency scan returned no known vulnerabilities at execution time; this is not a guarantee against undiscovered vulnerabilities. Tests use only temporary fictional data and mocked SMTP. This is an implementation review, not an independent penetration test.
+Validation: 52 unit/integration cases and a Chromium workflow, clean installation, pip dependency checks and dependency vulnerability scan. The final dependency scan returned no known vulnerabilities at execution time; this is not a guarantee against undiscovered vulnerabilities. Tests use only temporary fictional data and mocked SMTP. This is an implementation review, not an independent penetration test.
 
 ## Import review
 
@@ -27,3 +27,9 @@ SameSite=Lax allows a top-level GET after an external Codespaces authentication 
 ## Proxy-aware session error handling
 
 Browser uploads no longer make an unconditional request to the separate token endpoint. They use the rendered form's CSRF token and refresh it only after a 403, by reading the authenticated same-origin import page. Confirmation reads the token from that same page. No CSRF check or authentication requirement has been removed. Successful same-origin redirects are accepted, while missing routes and proxy errors are reported with their HTTP status rather than being treated as session expiration. API callers requesting JSON receive a JSON 401/403 instead of an HTML redirect. Regression tests cover the legacy token endpoint being unavailable, a successful redirect during CSRF renewal, 503 and repeated 403 errors with preserved file selection, and an actual 401 login rejection. Only one CSRF retry is made.
+
+## Session namespace and failure provenance
+
+MiniBird uses its own `minibird_session` cookie instead of the generic `session` name. A separate generic cookie cannot overwrite its authenticated state; existing cookies belonging to other software are never deleted. The old cookie is not imported as authentication. Updating an existing instance requires a one-time login to issue the new cookie, preserving account/data. Tests reproduce an authenticated page followed by an immediate upload 401 when the old generic cookie is overwritten; the namespaced cookie prevents that reproduction in both TestClient and Chromium, including a full large-file import. This reproduction is evidence of collision resistance, not proof that a collision occurred in a user's inaccessible Codespace.
+
+App responses carry a fixed `X-MiniBird-Response` marker. API authentication errors expose only non-secret reason codes for missing cookie, invalid cookie, and absent administrator authentication. The frontend distinguishes these from a 401 without the app marker; that unverified response is not presented as proof of an expired MiniBird session. No credential, cookie value or secret fingerprint is included. All authentication and CSRF requirements remain in force.

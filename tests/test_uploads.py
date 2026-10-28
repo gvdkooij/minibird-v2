@@ -167,8 +167,34 @@ def test_json_api_reports_auth_failure_without_html_redirect(ctx):
     c,db=ctx
     response=c.post('/imports/uploads/start',json={'filename':'x.vcf','size':1},headers={'Accept':'application/json'},follow_redirects=False)
     assert response.status_code==401
-    assert response.json()=={'detail':'Log eerst in'}
+    assert response.json()=={'detail':'Log eerst in','code':'MB-COOKIE-MISSING'}
     setup(c)
     response=c.post('/imports/uploads/start',json={'filename':'x.vcf','size':1},headers={'Accept':'application/json'},follow_redirects=False)
     assert response.status_code==403
     assert 'beveiligingscode' in response.json()['detail']
+
+
+def test_generic_cookie_collision_does_not_log_out_import(ctx):
+    c,db=ctx;setup(c)
+    csrf=token(c,'/imports')
+    c.cookies.set('session','external-session-cookie',domain='testserver.local',path='/')
+    response=c.post('/imports/uploads/start',json={'filename':'x.vcf','size':1},headers={'Accept':'application/json','X-CSRF-Token':csrf})
+    assert response.status_code==200,response.text
+    assert c.get('/imports').status_code==200
+    assert 'minibird_session' in {cookie.name for cookie in c.cookies.jar}
+
+
+def test_auth_diagnostics_do_not_expose_cookie_or_secret(ctx):
+    c,db=ctx
+    headers={'Accept':'application/json'}
+    response=c.post('/imports/uploads/start',json={},headers=headers)
+    assert response.json()['code']=='MB-COOKIE-MISSING'
+    assert response.headers['x-minibird-response']=='1'
+    c.cookies.set('minibird_session','invalid-private-cookie',domain='testserver.local',path='/')
+    response=c.post('/imports/uploads/start',json={},headers=headers)
+    assert response.json()['code']=='MB-COOKIE-INVALID'
+    assert 'invalid-private-cookie' not in response.text and SECRET not in response.text
+    c.cookies.clear();setup(c)
+    response=c.get('/imports')
+    assert 'minibird_session=' in response.headers['set-cookie']
+    assert 'httponly' in response.headers['set-cookie'].lower()

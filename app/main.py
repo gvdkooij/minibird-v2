@@ -41,7 +41,7 @@ def create_app(database=None, secret=None, secure=None):
     os.chmod(database,0o600)
     cipher = Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(SessionMiddleware, secret_key=secret, https_only=secure, same_site='lax', max_age=28800)
+    app.add_middleware(SessionMiddleware, secret_key=secret, session_cookie='minibird_session', https_only=secure, same_site='lax', max_age=28800)
     app.mount('/static',StaticFiles(directory=BASE/'static'),name='static')
     templates = Jinja2Templates(directory=BASE/'templates')
     templates.env.filters['money'] = lambda n: f'€ {n/100:,.2f}'.replace(',','X').replace('.',',').replace('X','.')
@@ -59,7 +59,7 @@ def create_app(database=None, secret=None, secure=None):
     @app.middleware('http')
     async def headers(request, call_next):
         response = await call_next(request)
-        response.headers.update({'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'same-origin','Content-Security-Policy':"default-src 'self'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",'Cache-Control':'no-store'})
+        response.headers.update({'X-MiniBird-Response':'1','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'same-origin','Content-Security-Policy':"default-src 'self'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",'Cache-Control':'no-store'})
         if secure: response.headers['Strict-Transport-Security']='max-age=31536000'
         LOG.info(json.dumps({'event':'http','method':request.method,'status':response.status_code}))
         return response
@@ -67,12 +67,18 @@ def create_app(database=None, secret=None, secure=None):
     @app.exception_handler(HTTPException)
     async def error(request, exc):
         if 'application/json' in request.headers.get('accept',''):
-            return JSONResponse({'detail':exc.detail},status_code=exc.status_code)
+            body={'detail':exc.detail}
+            if exc.status_code==401: body['code']=getattr(request.state,'auth_failure','MB-AUTH-REQUIRED')
+            return JSONResponse(body,status_code=exc.status_code)
         if exc.status_code==401: return go('/login')
         return HTMLResponse(templates.env.get_template('error.html').render(csrf=request.session.get('csrf',''),logged=bool(request.session.get('admin')),message=exc.detail,code=exc.status_code),status_code=exc.status_code)
 
     def require(request):
-        if not request.session.get('admin'): raise HTTPException(401,'Log eerst in')
+        if not request.session.get('admin'):
+            if not request.cookies.get('minibird_session'): request.state.auth_failure='MB-COOKIE-MISSING'
+            elif not request.session: request.state.auth_failure='MB-COOKIE-INVALID'
+            else: request.state.auth_failure='MB-AUTH-REQUIRED'
+            raise HTTPException(401,'Log eerst in')
 
     async def form(request, auth=True):
         if auth: require(request)
