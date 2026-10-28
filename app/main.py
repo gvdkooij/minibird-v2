@@ -167,19 +167,19 @@ def create_app(database=None, secret=None, secure=None):
         require(request)
         with connect(database) as db: customer=db.execute('SELECT * FROM customers WHERE id=?',(id,)).fetchone()
         if not customer: raise HTTPException(404,'Klant niet gevonden')
-        return render(request,'customer.html',customer=customer)
+        return render(request,'customer.html',customer=customer,extra=json.loads(customer['import_extra']))
 
     @app.post('/customers')
     async def customer_save(request:Request):
         f=await form(request)
-        values=[text(f,'name',True),email(text(f,'email')),text(f,'address',True),text(f,'kvk'),text(f,'vat'),text(f,'contact')]
+        values=[text(f,'name',True),email(text(f,'email')),text(f,'address',True),text(f,'kvk'),text(f,'vat'),text(f,'contact'),text(f,'phone')]
         with connect(database) as db:
             if f.get('id'):
                 try: customer_id=int(f['id'])
                 except ValueError: raise HTTPException(422,'Ongeldig klantnummer')
                 if not db.execute('SELECT 1 FROM customers WHERE id=?',(customer_id,)).fetchone(): raise HTTPException(404,'Klant niet gevonden')
-                db.execute('UPDATE customers SET name=?,email=?,address=?,kvk=?,vat=?,contact=? WHERE id=?',(*values,customer_id))
-            else: db.execute('INSERT INTO customers(name,email,address,kvk,vat,contact) VALUES(?,?,?,?,?,?)',values)
+                db.execute('UPDATE customers SET name=?,email=?,address=?,kvk=?,vat=?,contact=?,phone=? WHERE id=?',(*values,customer_id))
+            else: db.execute('INSERT INTO customers(name,email,address,kvk,vat,contact,phone) VALUES(?,?,?,?,?,?,?)',values)
         return go('/customers')
 
     @app.post('/customers/{id}/{action}')
@@ -188,7 +188,7 @@ def create_app(database=None, secret=None, secure=None):
         with connect(database) as db:
             if action in ('archive','restore'): db.execute('UPDATE customers SET archived=? WHERE id=?',(int(action=='archive'),id))
             elif action=='delete':
-                if db.execute('SELECT 1 FROM documents WHERE customer_id=?',(id,)).fetchone(): raise HTTPException(409,'Deze klant heeft documenten. Archiveer de klant.')
+                if db.execute('SELECT 1 FROM documents WHERE customer_id=?',(id,)).fetchone() or db.execute('SELECT 1 FROM import_links WHERE customer_id=?',(id,)).fetchone(): raise HTTPException(409,'Deze klant heeft documenten. Archiveer de klant.')
                 db.execute('DELETE FROM customers WHERE id=?',(id,))
             else: raise HTTPException(404,'Onbekende actie')
         return go('/customers')
@@ -236,7 +236,7 @@ def create_app(database=None, secret=None, secure=None):
         return render(request,'message.html',message='SMTP-verbinding geslaagd. Er is geen e-mail verstuurd.')
 
     def state(d):
-        return 'overdue' if d['kind']=='invoice' and d['status']=='sent' and d['due']<date.today().isoformat() else d['status']
+        return 'overdue' if d['status']=='sent' and d['due']<date.today().isoformat() else d['status']
 
     def document(db,id):
         row=db.execute('SELECT * FROM documents WHERE id=?',(id,)).fetchone()
@@ -244,6 +244,8 @@ def create_app(database=None, secret=None, secure=None):
         d=dict(row)
         for key in ('customer','company','lines'): d[key]=json.loads(d[key])
         d['display_status']=state(d)
+        imported=db.execute('SELECT batch_id,original_status FROM document_imports WHERE document_id=?',(id,)).fetchone()
+        d['imported']=dict(imported) if imported else None
         return d
 
     def insert(db,kind,customer,company,lines,due,source=None):
@@ -313,7 +315,9 @@ def create_app(database=None, secret=None, secure=None):
     def download(request:Request,id:int):
         require(request)
         with connect(database) as db: d=document(db,id)
-        return Response(pdf(d),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{d["number"]}.pdf"'})
+        with connect(database) as db:
+            original=db.execute('SELECT pdf FROM document_imports WHERE document_id=?',(id,)).fetchone()
+        return Response(original['pdf'] if original else pdf(d),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{d["number"]}.pdf"'})
 
     @app.post('/documents/{id}/{action}')
     async def action(request:Request,id:int,action:str):
@@ -321,6 +325,7 @@ def create_app(database=None, secret=None, secure=None):
         with connect(database) as db:
             db.execute('BEGIN IMMEDIATE')
             d=document(db,id)
+            if d['imported']: raise HTTPException(409,'Geïmporteerde documenten zijn alleen-lezen. Maak voor nieuwe acties een nieuw document.')
             if action=='delete' and d['status']=='draft':
                 db.execute('DELETE FROM documents WHERE id=?',(id,)); return go('/documents?kind='+d['kind'])
             if action=='issue' and d['status']=='draft': new='sent'
@@ -342,4 +347,6 @@ def create_app(database=None, secret=None, secure=None):
             else: raise HTTPException(409,'Deze actie is niet toegestaan in de huidige status')
             db.execute('UPDATE documents SET status=? WHERE id=?',(new,id))
         return go(f'/documents/{id}')
+    from .import_routes import register_import_routes
+    register_import_routes(app,database,render,require,form,go)
     return app

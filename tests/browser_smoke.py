@@ -12,6 +12,7 @@ import urllib.request
 from playwright.sync_api import sync_playwright
 
 root=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(root))
 with tempfile.TemporaryDirectory() as tmp:
     with socket.socket() as s:
         s.bind(('127.0.0.1',0)); port=s.getsockname()[1]
@@ -40,13 +41,13 @@ with tempfile.TemporaryDirectory() as tmp:
             page.get_by_label('Adres',exact=True).fill('Gracht 1, Utrecht')
             page.get_by_role('button',name='Instellingen opslaan').click()
             page.get_by_role('link',name='Klanten',exact=True).click()
-            page.get_by_label('Bedrijfsnaam / naam').fill('Voorbeeld BV')
+            page.get_by_label('Bedrijfsnaam / naam').fill('Browser Voorbeeld BV')
             page.get_by_label('E-mailadres',exact=True).fill('klant@example.nl')
             page.get_by_label('Adres',exact=True).fill('Markt 2, Amsterdam')
             page.get_by_role('button',name='Klant opslaan').click()
             page.get_by_role('link',name='Offertes',exact=True).click()
             page.get_by_role('link',name='+ Nieuwe offerte').click()
-            page.locator('[name=customer_id]').select_option(label='Voorbeeld BV')
+            page.locator('[name=customer_id]').select_option(label='Browser Voorbeeld BV')
             page.get_by_label('Omschrijving',exact=True).fill('Ontwerp en advies')
             page.get_by_label('Prijs excl. btw (€)').fill('100')
             page.get_by_role('button',name='+ Regel toevoegen').click()
@@ -76,7 +77,31 @@ with tempfile.TemporaryDirectory() as tmp:
             page.get_by_role('button',name='Inloggen',exact=True).click()
             assert 'Goed overzicht' in page.inner_text('main')
             assert not errors,errors
+            # Exercise multipart uploads and confirmation in the real browser.
+            from test_imports import VCF, export_files, zipped
+            page.get_by_role('link',name='Importeren',exact=True).click()
+            page.get_by_label('Exportbestand').set_input_files({'name':'contacts.vcf','mimeType':'text/vcard','buffer':VCF})
+            page.get_by_role('button',name='Bestand controleren').click()
+            assert 'Import controleren' in page.inner_text('main')
+            page.get_by_role('checkbox').check()
+            page.get_by_role('button',name='Import definitief opslaan').click()
+            assert 'Import voltooid' in page.inner_text('main')
+            page.get_by_role('link',name='Importeren',exact=True).click()
+            page.get_by_label('Exportbestand').set_input_files({'name':'moneybird.zip','mimeType':'application/zip','buffer':zipped(export_files())})
+            page.get_by_role('button',name='Bestand controleren').click()
+            assert '2024-0001' in page.inner_text('main')
+            page.get_by_role('checkbox').check()
+            page.get_by_role('button',name='Import definitief opslaan').click()
+            assert '2 historische documenten toegevoegd' in page.inner_text('main')
+            page.get_by_role('link',name='Naar facturen',exact=True).click()
+            page.get_by_role('link',name='2024-0001',exact=True).click()
+            assert 'Geïmporteerd archiefdocument' in page.inner_text('main')
+            assert page.get_by_role('button',name='Opnieuw e-mailen').count()==0
+            with page.expect_download() as imported_pdf:
+                page.get_by_role('link',name='PDF downloaden').click()
+            assert Path(imported_pdf.value.path()).read_bytes().startswith(b'%PDF-')
+            assert not errors,errors
             browser.close()
-        print('Browser smoke: setup, settings, customer, multi-line quote, conversion, PDF, payment, responsive dashboard, logout/login PASSED')
+        print('Browser smoke: setup, settings, customer, multi-line quote, conversion, PDF, payment, responsive dashboard, logout/login, vCard/ZIP import and original PDF PASSED')
     finally:
         process.terminate();process.wait(timeout=10)
