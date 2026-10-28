@@ -32,6 +32,7 @@ with tempfile.TemporaryDirectory() as tmp:
             page=browser.new_page(viewport={'width':1440,'height':1000})
             errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
             page.goto(url+'/setup')
+            prelogin_cookies=page.context.cookies(url)
             page.get_by_label('E-mailadres',exact=True).fill('browser@example.nl')
             password=secrets.token_urlsafe(24)
             page.get_by_label('Wachtwoord',exact=True).fill(password)
@@ -116,7 +117,19 @@ with tempfile.TemporaryDirectory() as tmp:
             page.get_by_role('heading',name='Import voltooid',exact=True).wait_for()
             assert 'Import voltooid' in page.inner_text('main')
             page.get_by_role('link',name='Importeren',exact=True).click()
-            page.get_by_label('Exportbestand').set_input_files({'name':'moneybird.zip','mimeType':'application/zip','buffer':zipped(export_files())})
+            # A delayed anonymous response arrives after upload starts. It must
+            # not overwrite the established login when the next request begins.
+            delayed_cookies=[]
+            auth_before=next(c['value'] for c in page.context.cookies(url) if c['name']=='minibird_session')
+            def late_anonymous_response(route):
+                if route.request.url.endswith('/chunks/1') and not delayed_cookies:
+                    page.context.add_cookies(prelogin_cookies)
+                    delayed_cookies.append(True)
+                route.continue_()
+            page.route('**/imports/uploads/**/chunks/*',late_anonymous_response)
+            padded_export=export_files()
+            padded_export['reports/upload-padding.bin']=secrets.token_bytes(700000)
+            page.get_by_label('Exportbestand').set_input_files({'name':'moneybird.zip','mimeType':'application/zip','buffer':zipped(padded_export)})
             page.get_by_role('button',name='Bestand controleren').click()
             page.get_by_role('heading',name='Import controleren',exact=True).wait_for()
             assert '2024-0001' in page.inner_text('main')
@@ -125,6 +138,8 @@ with tempfile.TemporaryDirectory() as tmp:
             page.get_by_role('button',name='Import definitief opslaan').click()
             page.get_by_role('heading',name='Import voltooid',exact=True).wait_for()
             assert '2 historische documenten toegevoegd' in page.inner_text('main')
+            assert delayed_cookies
+            assert next(c['value'] for c in page.context.cookies(url) if c['name']=='minibird_session')==auth_before
             page.get_by_role('link',name='Naar facturen',exact=True).click()
             page.get_by_role('link',name='2024-0001',exact=True).click()
             assert 'Geïmporteerd archiefdocument' in page.inner_text('main')

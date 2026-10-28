@@ -216,7 +216,7 @@ def test_migrate_version_one_preserves_existing_customer(tmp_path):
         db.execute('PRAGMA user_version=1')
     migrate(path);migrate(path)
     with connect(path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0]==3
+        assert db.execute('PRAGMA user_version').fetchone()[0]==4
         assert db.execute('SELECT name,phone FROM customers').fetchone()[:]==('Oud','')
 
 

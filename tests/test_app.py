@@ -138,7 +138,7 @@ def test_persistence_migration_backup_restart(ctx,tmp_path):
     with pytest.raises(ValueError): backup(db,dest)
     with sqlite3.connect(dest) as conn:
         assert conn.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
-        assert conn.execute('PRAGMA user_version').fetchone()[0]==3
+        assert conn.execute('PRAGMA user_version').fetchone()[0]==4
         assert conn.execute('SELECT count(*) FROM documents').fetchone()[0]==1
     restarted=TestClient(create_app(str(dest),SECRET,False))
     assert post(restarted,'/login',{'email':'admin@example.nl','password':'correct horse battery staple'},'/login').status_code==303
@@ -183,7 +183,7 @@ def test_private_routes_require_login(ctx,path):
 def test_future_schema_and_missing_backup_source(tmp_path):
     db=str(tmp_path/'future.sqlite')
     migrate(db)
-    with connect(db) as conn: conn.execute('PRAGMA user_version=4')
+    with connect(db) as conn: conn.execute('PRAGMA user_version=5')
     with pytest.raises(RuntimeError): migrate(db)
     with pytest.raises(ValueError): backup(tmp_path/'missing.sqlite',tmp_path/'bad.sqlite')
 

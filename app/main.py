@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from reportlab.pdfgen import canvas
-from starlette.middleware.sessions import SessionMiddleware
+from .sessions import ServerSessionMiddleware
 from .db import connect, migrate
 from .domain import calculate
 
@@ -41,7 +41,7 @@ def create_app(database=None, secret=None, secure=None):
     os.chmod(database,0o600)
     cipher = Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(SessionMiddleware, secret_key=secret, session_cookie='minibird_session', https_only=secure, same_site='lax', max_age=28800)
+    app.add_middleware(ServerSessionMiddleware, database=database, secret_key=secret, secure=secure)
     app.mount('/static',StaticFiles(directory=BASE/'static'),name='static')
     templates = Jinja2Templates(directory=BASE/'templates')
     templates.env.filters['money'] = lambda n: f'€ {n/100:,.2f}'.replace(',','X').replace('.',',').replace('X','.')
@@ -76,7 +76,7 @@ def create_app(database=None, secret=None, secure=None):
     def require(request):
         if not request.session.get('admin'):
             if not request.cookies.get('minibird_session'): request.state.auth_failure='MB-COOKIE-MISSING'
-            elif not request.session: request.state.auth_failure='MB-COOKIE-INVALID'
+            elif request.scope.get('minibird_auth_state')=='invalid': request.state.auth_failure='MB-COOKIE-INVALID'
             else: request.state.auth_failure='MB-AUTH-REQUIRED'
             raise HTTPException(401,'Log eerst in')
 
