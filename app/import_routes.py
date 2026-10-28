@@ -10,7 +10,7 @@ import time
 from fastapi import HTTPException, Request
 from fastapi.responses import Response
 from .db import connect
-from .importing import MAX_UPLOAD, ImportProblem, fingerprint, norm, parse_upload
+from .importing import CHUNK_SIZE, MAX_UPLOAD, ImportProblem, fingerprint, legacy_document_fingerprint, norm, parse_upload
 
 
 def plan_import(db, payload):
@@ -51,7 +51,7 @@ def plan_import(db, payload):
         elif not customer_plan or customer_plan['status']=='conflict':
             status,reason='conflict','Klantkoppeling is niet eenduidig; document wordt overgeslagen.'
         elif current:
-            status = 'existing' if current['fingerprint']==fingerprint(doc) else 'conflict'
+            status = 'existing' if current['fingerprint'] in (fingerprint(doc),legacy_document_fingerprint(doc)) else 'conflict'
             reason = 'Dit document is al geïmporteerd.' if status=='existing' else 'Het nummer bestaat met andere gegevens. Wordt niet overschreven.'
         else:
             status,reason='new','Nieuw historisch document, alleen-lezen.'
@@ -79,6 +79,11 @@ def register_import_routes(app, database, render, require, form, go):
             history=db.execute('SELECT id,filename,summary FROM import_batches WHERE confirmed=1 ORDER BY created DESC').fetchall()
         return render(request,'imports.html',history=history)
 
+    @app.get('/imports/token')
+    def current_token(request:Request):
+        require(request)
+        return {'csrf':request.session.setdefault('csrf',secrets.token_urlsafe(32))}
+
     @app.post('/imports/preview')
     async def preview(request:Request):
         # Authorization happens before multipart parsing. The stream limit applies
@@ -87,7 +92,7 @@ def register_import_routes(app, database, render, require, form, go):
         size=0
         async for chunk in request.stream():
             size+=len(chunk)
-            if size>MAX_UPLOAD+65536: raise HTTPException(413,'Upload maximaal 10 MB.')
+            if size>MAX_UPLOAD+65536: raise HTTPException(413,'Upload maximaal 50 MB.')
             # The request body is bounded; cache it for the existing CSRF/form code.
             if size==len(chunk): body=bytearray()
             body.extend(chunk)
@@ -98,19 +103,110 @@ def register_import_routes(app, database, render, require, form, go):
         data=await upload.read(MAX_UPLOAD+1)
         await upload.close()
         filename=str(upload.filename or '').replace('\\','/').rsplit('/',1)[-1][:200]
+        with connect(database) as db:
+            id=store_preview(db,request,filename,data)
+        return go('/imports/'+id)
+
+    def store_preview(db,request,filename,data):
         try: payload=parse_upload(filename,data)
         except ImportProblem as exc: raise HTTPException(422,str(exc)) from None
-        with connect(database) as db:
-            db.execute('DELETE FROM import_batches WHERE confirmed=0 AND created<?',(time.time()-3600,))
-            # Keep at most three previews per session; remove cancelled/older raw uploads.
-            old=list(request.session.get('imports',[]))
-            for id in old[:-2]: db.execute('DELETE FROM import_batches WHERE id=? AND confirmed=0',(id,))
-            id=secrets.token_urlsafe(24)
-            plan=plan_import(db,payload)
-            db.execute('INSERT INTO import_batches(id,created,filename,payload,original,summary) VALUES(?,?,?,?,?,?)',
-                       (id,time.time(),filename,json.dumps(payload),data,json.dumps({'plan_hash':plan_hash(plan)})))
+        db.execute('DELETE FROM import_uploads WHERE created<?',(time.time()-3600,))
+        db.execute('DELETE FROM import_batches WHERE confirmed=0 AND created<?',(time.time()-3600,))
+        old=list(request.session.get('imports',[]))
+        for id in old[:-2]:
+            db.execute('DELETE FROM import_uploads WHERE batch_id=?',(id,))
+            db.execute('DELETE FROM import_batches WHERE id=? AND confirmed=0',(id,))
+        id=secrets.token_urlsafe(24)
+        plan=plan_import(db,payload)
+        db.execute('INSERT INTO import_batches(id,created,filename,payload,original,summary) VALUES(?,?,?,?,?,?)',
+                   (id,time.time(),filename,json.dumps(payload),data,json.dumps({'plan_hash':plan_hash(plan)})))
         request.session['imports']=(old+[id])[-3:]
-        return go('/imports/'+id)
+        return id
+
+    def header_auth(request):
+        require(request)
+        token=request.headers.get('X-CSRF-Token','')
+        expected=request.session.get('csrf')
+        if not expected or not secrets.compare_digest(token.encode(),expected.encode()):
+            raise HTTPException(403,'Ongeldige beveiligingscode. Vernieuw de importpagina.')
+
+    async def bounded_body(request,limit):
+        result=bytearray()
+        async for chunk in request.stream():
+            if len(result)+len(chunk)>limit: raise HTTPException(413,'Dit uploaddeel is te groot.')
+            result.extend(chunk)
+        return bytes(result)
+
+    def owned_upload(db,request,id):
+        if id not in request.session.get('uploads',[]):
+            raise HTTPException(404,'Upload niet gevonden in deze sessie.')
+        row=db.execute('SELECT * FROM import_uploads WHERE id=?',(id,)).fetchone()
+        if not row or row['created']<time.time()-3600:
+            raise HTTPException(404,'Upload verlopen. Kies het bestand opnieuw.')
+        return row
+
+    @app.post('/imports/uploads/start')
+    async def start_upload(request:Request):
+        header_auth(request)
+        try:
+            metadata=json.loads(await bounded_body(request,4096))
+            filename=str(metadata['filename']).replace('\\','/').rsplit('/',1)[-1][:200]
+            size=metadata['size']
+            if type(size) is not int or size<=0: raise ValueError()
+        except (KeyError,ValueError,TypeError): raise HTTPException(422,'Ongeldige bestandsgegevens.')
+        if size>MAX_UPLOAD: raise HTTPException(413,'Upload maximaal 50 MB.')
+        if not filename.lower().endswith(('.vcf','.zip')): raise HTTPException(422,'Kies een .vcf- of Moneybird .zip-bestand.')
+        with connect(database) as db:
+            db.execute('DELETE FROM import_uploads WHERE created<?',(time.time()-3600,))
+            old=list(request.session.get('uploads',[]))
+            for old_id in old[:-2]: db.execute('DELETE FROM import_uploads WHERE id=?',(old_id,))
+            id=secrets.token_urlsafe(24)
+            db.execute('INSERT INTO import_uploads(id,created,filename,total_size) VALUES(?,?,?,?)',(id,time.time(),filename,size))
+        request.session['uploads']=(old+[id])[-3:]
+        return {'id':id,'chunk_size':CHUNK_SIZE}
+
+    @app.put('/imports/uploads/{id}/chunks/{part}')
+    async def upload_chunk(request:Request,id:str,part:int):
+        header_auth(request)
+        data=await bounded_body(request,CHUNK_SIZE)
+        digest=hashlib.sha256(data).hexdigest()
+        with connect(database) as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=owned_upload(db,request,id)
+            if row['batch_id']: raise HTTPException(409,'Upload is al verwerkt.')
+            if part<row['next_part']:
+                previous=db.execute('SELECT digest FROM import_chunks WHERE upload_id=? AND part=?',(id,part)).fetchone()
+                if previous and previous['digest']==digest: return {'received':row['received_size']}
+                raise HTTPException(409,'Een opnieuw verstuurd deel wijkt af.')
+            if part!=row['next_part']: raise HTTPException(409,'Uploaddelen moeten op volgorde worden verstuurd.')
+            expected=min(CHUNK_SIZE,row['total_size']-row['received_size'])
+            if not data or len(data)!=expected: raise HTTPException(422,'Uploaddeel is onvolledig of heeft een onjuiste grootte.')
+            db.execute('INSERT INTO import_chunks VALUES(?,?,?,?)',(id,part,digest,data))
+            db.execute('UPDATE import_uploads SET received_size=received_size+?,next_part=next_part+1 WHERE id=?',(len(data),id))
+        return {'received':row['received_size']+len(data)}
+
+    @app.post('/imports/uploads/{id}/complete')
+    async def complete_upload(request:Request,id:str):
+        header_auth(request)
+        with connect(database) as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=owned_upload(db,request,id)
+            if row['batch_id']: return {'preview':'/imports/'+row['batch_id']}
+            if row['received_size']!=row['total_size']: raise HTTPException(409,'Het bestand is nog niet volledig ontvangen.')
+            data=b''.join(chunk['data'] for chunk in db.execute('SELECT data FROM import_chunks WHERE upload_id=? ORDER BY part',(id,)))
+            if len(data)!=row['total_size']: raise HTTPException(409,'De upload is onvolledig. Kies het bestand opnieuw.')
+            batch_id=store_preview(db,request,row['filename'],data)
+            db.execute('UPDATE import_uploads SET batch_id=? WHERE id=?',(batch_id,id))
+            db.execute('DELETE FROM import_chunks WHERE upload_id=?',(id,))
+        return {'preview':'/imports/'+batch_id}
+
+    @app.delete('/imports/uploads/{id}')
+    async def cancel_upload(request:Request,id:str):
+        header_auth(request)
+        with connect(database) as db:
+            row=owned_upload(db,request,id)
+            db.execute('DELETE FROM import_uploads WHERE id=?',(id,))
+        return {'cancelled':True}
 
     @app.get('/imports/{id}')
     def preview_page(request:Request,id:str):
@@ -178,6 +274,7 @@ def register_import_routes(app, database, render, require, form, go):
         with connect(database) as db:
             batch=batch_for(db,request,id)
             if batch['confirmed']: raise HTTPException(409,'Een bevestigde import kan niet worden geannuleerd.')
+            db.execute('DELETE FROM import_uploads WHERE batch_id=?',(id,))
             db.execute('DELETE FROM import_batches WHERE id=?',(id,))
         return go('/imports')
 

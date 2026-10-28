@@ -41,7 +41,7 @@ def create_app(database=None, secret=None, secure=None):
     os.chmod(database,0o600)
     cipher = Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(SessionMiddleware, secret_key=secret, https_only=secure, same_site='strict', max_age=28800)
+    app.add_middleware(SessionMiddleware, secret_key=secret, https_only=secure, same_site='lax', max_age=28800)
     app.mount('/static',StaticFiles(directory=BASE/'static'),name='static')
     templates = Jinja2Templates(directory=BASE/'templates')
     templates.env.filters['money'] = lambda n: f'€ {n/100:,.2f}'.replace(',','X').replace('.',',').replace('X','.')
@@ -317,7 +317,8 @@ def create_app(database=None, secret=None, secure=None):
         with connect(database) as db: d=document(db,id)
         with connect(database) as db:
             original=db.execute('SELECT pdf FROM document_imports WHERE document_id=?',(id,)).fetchone()
-        return Response(original['pdf'] if original else pdf(d),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{d["number"]}.pdf"'})
+        filename=re.sub(r'[^A-Za-z0-9_.-]', '_', d['number']).lstrip('.') or 'document'
+        return Response(original['pdf'] if original else pdf(d),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{filename}.pdf"'})
 
     @app.post('/documents/{id}/{action}')
     async def action(request:Request,id:int,action:str):

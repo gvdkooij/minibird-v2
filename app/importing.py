@@ -16,7 +16,9 @@ import zipfile
 from defusedxml import ElementTree
 from openpyxl import load_workbook
 
-MAX_UPLOAD = 10 * 1024 * 1024
+MAX_UPLOAD = 50 * 1024 * 1024
+CHUNK_SIZE = 512 * 1024
+MAX_MEMBER = 10 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
 MAX_ENTRIES = 500
 MAX_ROWS = 5000
@@ -132,7 +134,7 @@ def checked_zip(data):
             if entry.filename in seen or path.is_absolute() or '..' in path.parts or '\\' in entry.filename or entry.flag_bits & 1 or (entry.external_attr >> 16) & 0o170000 == 0o120000:
                 raise ImportProblem('Het archief bevat onveilige, dubbele of versleutelde bestandsnamen.')
             seen.add(entry.filename)
-            if entry.file_size>MAX_UPLOAD or entry.file_size > max(1, entry.compress_size)*1000:
+            if entry.file_size>MAX_MEMBER or entry.file_size > max(1, entry.compress_size)*1000:
                 raise ImportProblem('Een bestand in het archief is te groot of te sterk gecomprimeerd.')
         return archive
     except zipfile.BadZipFile:
@@ -230,6 +232,20 @@ def source_status(value, kind):
     return result
 
 
+def tax_category(node):
+    if node is None: raise ImportProblem('UBL-regel mist de btw-categorie.')
+    code = node_text(node,'c:ID')
+    value = node_text(node,'c:Percent')
+    if not value and code in ('O','E','Z'):
+        rate = Decimal(0)
+    else:
+        rate = decimal(value)
+    if rate not in (0,9,21) or code in ('O','E','Z') and rate != 0:
+        raise ImportProblem('Niet-ondersteunde of tegenstrijdige btw-categorie.')
+    label = {'O':'Geen btw','E':'Btw vrijgesteld'}.get(code, str(rate.normalize())+'%')
+    return rate, code, label
+
+
 def ubl_document(data, summary):
     root = ElementTree.fromstring(data, forbid_dtd=True)
     if root.tag != '{urn:oasis:names:specification:ubl:schema:xsd:Invoice-2}Invoice':
@@ -242,28 +258,29 @@ def ubl_document(data, summary):
     for line in root.findall('a:InvoiceLine',NS):
         quantity=decimal(node_text(line,'c:InvoicedQuantity'))
         price=decimal(node_text(line,'a:Price/c:PriceAmount'))
-        rate=decimal(node_text(line,'a:Item/a:ClassifiedTaxCategory/c:Percent'))
+        rate, tax_code, tax_label=tax_category(line.find('a:Item/a:ClassifiedTaxCategory',NS))
         if quantity<=0 or rate not in (0,9,21): raise ImportProblem('Niet-ondersteunde UBL-regel of btw-percentage.')
         net=money(node_text(line,'c:LineExtensionAmount'))
         vat=int((Decimal(net)*rate/100).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
-        lines.append(dict(description=clean(node_text(line,'a:Item/c:Description') or node_text(line,'a:Item/c:Name'),10000),quantity=str(quantity),price=str(price),rate=str(rate),net=net,vat=vat))
+        lines.append(dict(description=clean(node_text(line,'a:Item/c:Description') or node_text(line,'a:Item/c:Name'),10000),quantity=str(quantity),price=str(price),rate=str(rate),net=net,vat=vat,tax_code=tax_code,tax_label=tax_label))
     if not lines or len(lines)>1000: raise ImportProblem('Ongeldig aantal UBL-regels.')
     # Moneybird may calculate VAT before rounding the line net (e.g. an inclusive
     # EUR 1,200 price). Preserve the declared tax subtotal, including that cent.
     tax_groups = root.findall('a:TaxTotal/a:TaxSubtotal', NS)
     seen_rates = set()
     for group in tax_groups:
-        rate = decimal(node_text(group,'a:TaxCategory/c:Percent'))
-        if rate in seen_rates: raise ImportProblem('Meerdere UBL-btw-groepen met hetzelfde tarief worden niet ondersteund.')
-        seen_rates.add(rate)
-        group_lines = [line for line in lines if Decimal(line['rate'])==rate]
+        rate, code, _ = tax_category(group.find('a:TaxCategory',NS))
+        key = (rate,code)
+        if key in seen_rates: raise ImportProblem('Meerdere UBL-btw-groepen met hetzelfde tarief worden niet ondersteund.')
+        seen_rates.add(key)
+        group_lines = [line for line in lines if (Decimal(line['rate']),line['tax_code'])==key]
         target = money(node_text(group,'c:TaxAmount'))
         delta = target - sum(line['vat'] for line in group_lines)
         if not group_lines or money(node_text(group,'c:TaxableAmount'))!=sum(line['net'] for line in group_lines) or abs(delta)>len(group_lines):
             raise ImportProblem('De UBL-btw-groepen sluiten niet aan op de regels.')
         for index in range(abs(delta)):
             group_lines[index % len(group_lines)]['vat'] += 1 if delta>0 else -1
-    if set(Decimal(line['rate']) for line in lines)!=seen_rates or sum(line['vat'] for line in lines)!=money(node_text(root,'a:TaxTotal/c:TaxAmount')):
+    if set((Decimal(line['rate']),line['tax_code']) for line in lines)!=seen_rates or sum(line['vat'] for line in lines)!=money(node_text(root,'a:TaxTotal/c:TaxAmount')):
         raise ImportProblem('Het UBL-btw-totaal sluit niet aan.')
     total=money(node_text(root,'a:LegalMonetaryTotal/c:TaxInclusiveAmount'))
     if sum(l['net'] for l in lines)!=money(node_text(root,'a:LegalMonetaryTotal/c:TaxExclusiveAmount')) or sum(l['net']+l['vat'] for l in lines)!=total or money(summary.get('totaalprijs inclusief btw'))!=total:
@@ -318,24 +335,29 @@ def parse_moneybird(data):
             detail=spreadsheet(archive.read(quote_detail_files[0]))
             for summary in summaries:
                 if str(summary.get('valuta','')).upper()!='EUR': raise ImportProblem('Alleen EUR-documenten worden ondersteund.')
-                number=safe_number(summary.get('offertenummer')); lines=[]
+                raw_number=str(summary.get('offertenummer') or '')
+                draft_match=re.fullmatch(r'Concept #(\d{1,10})',raw_number) if summary.get('status')=='draft' else None
+                number=raw_number if draft_match else safe_number(raw_number)
+                lines=[]
                 for row in detail:
                     if str(row.get('offertenummer'))!=number: continue
                     rate_text=str(row.get('btw') or '')
                     match=re.fullmatch(r'(0|9|21)% btw',rate_text)
-                    if not match: raise ImportProblem('Niet-ondersteund btw-tarief op een offerte.')
-                    rate=int(match[1]); net=money(row.get('totaalprijs exclusief btw inclusief korting'))
+                    if not match and rate_text not in ('Btw vrijgesteld','Geen btw'): raise ImportProblem('Niet-ondersteund btw-tarief op een offerte.')
+                    rate=int(match[1]) if match else 0; net=money(row.get('totaalprijs exclusief btw inclusief korting'))
                     quantity=decimal(row.get('aantal (decimaal)')); price=decimal(row.get('prijs'))
                     if quantity<=0: raise ImportProblem('Ongeldige hoeveelheid in offerte.')
-                    lines.append(dict(description=clean(row.get('omschrijving'),10000),quantity=str(quantity),price=str(price),rate=str(rate),net=net,vat=int((Decimal(net)*rate/100).quantize(Decimal('1'),rounding=ROUND_HALF_UP))))
+                    lines.append(dict(description=clean(row.get('omschrijving'),10000),quantity=str(quantity),price=str(price),rate=str(rate),net=net,tax_label=rate_text,vat=int((Decimal(net)*rate/100).quantize(Decimal('1'),rounding=ROUND_HALF_UP))))
                 total=money(summary.get('totaalprijs inclusief btw'))
                 if not lines or sum(l['net'] for l in lines)!=money(summary.get('totaalprijs exclusief btw')) or sum(l['net']+l['vat'] for l in lines)!=total:
                     raise ImportProblem('Offerte-regels, btw en totaal sluiten niet op elkaar aan.')
                 key=str(summary.get('klantnummer'))
                 if key not in by_number: raise ImportProblem('Offerte verwijst naar een ontbrekend contact.')
-                issued=day(summary.get('offerte datum'))
-                pdf_path='estimates_archive/'+issued[:4]+'/'+number+'.pdf'
-                if pdf_path not in names: raise ImportProblem('De originele offerte-PDF ontbreekt.')
+                issued='' if summary.get('status')=='draft' and not summary.get('offerte datum') else day(summary.get('offerte datum'))
+                pdf_name='draft_'+draft_match[1]+'.pdf' if draft_match else number+'.pdf'
+                pdf_matches=[n for n in names if n.startswith('estimates_archive/') and n.rsplit('/',1)[-1]==pdf_name]
+                if len(pdf_matches)!=1: raise ImportProblem('De originele offerte-PDF ontbreekt of is niet eenduidig.')
+                pdf_path=pdf_matches[0]
                 used.add(pdf_path)
                 documents.append(dict(kind='quote',number=number,date=issued,due=day(summary.get('vervaldatum')),customer=by_number[key],company=company,lines=lines,total=total,status=source_status(summary.get('status'),'quote'),original_status=str(summary.get('status')),external_id=clean(summary.get('id'),100),contact_key=key,pdf=read_pdf(archive,pdf_path)))
         for c in contacts:
@@ -358,12 +380,12 @@ def embedded_pdf(xml):
         if node.get('mimeCode')=='application/pdf':
             try: data=base64.b64decode(''.join((node.text or '').split()),validate=True)
             except ValueError: raise ImportProblem('Ongeldige ingebedde PDF.') from None
-            if data.startswith(b'%PDF-') and len(data)<=MAX_UPLOAD: return base64.b64encode(data).decode('ascii')
+            if data.startswith(b'%PDF-') and len(data)<=MAX_MEMBER: return base64.b64encode(data).decode('ascii')
     raise ImportProblem('De originele factuur-PDF ontbreekt.')
 
 
 def parse_upload(filename,data):
-    if not data or len(data)>MAX_UPLOAD: raise ImportProblem('Upload een niet-leeg bestand van maximaal 10 MB.')
+    if not data or len(data)>MAX_UPLOAD: raise ImportProblem('Upload een niet-leeg bestand van maximaal 50 MB.')
     try:
         extension=filename.lower().rsplit('.',1)[-1]
         if extension=='vcf': result=parse_vcards(data)
@@ -382,3 +404,12 @@ def parse_upload(filename,data):
 def fingerprint(document):
     # Original PDF included, so a changed source cannot silently replace history.
     return hashlib.sha256(json.dumps(document,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+def legacy_document_fingerprint(document):
+    """Recognize identical pre-tax-label imports without replacing their history."""
+    legacy = {**document, 'lines': [
+        {key:value for key,value in line.items() if key not in ('tax_code','tax_label')}
+        for line in document['lines']
+    ]}
+    return fingerprint(legacy)

@@ -24,7 +24,7 @@ def migrate(path):
     with connect(path) as db:
         db.execute('BEGIN IMMEDIATE')
         version = db.execute('PRAGMA user_version').fetchone()[0]
-        if version > 2:
+        if version > 3:
             raise RuntimeError('Database is nieuwer dan deze applicatie')
         # Run statements inside one transaction; executescript would commit early.
         for statement in SCHEMA.split(';'):
@@ -35,7 +35,10 @@ def migrate(path):
             db.execute("CREATE TABLE import_batches(id TEXT PRIMARY KEY, created REAL NOT NULL, filename TEXT NOT NULL, payload TEXT NOT NULL, original BLOB NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '{}')")
             db.execute("CREATE TABLE import_links(source TEXT NOT NULL, external_id TEXT NOT NULL, customer_id INTEGER NOT NULL REFERENCES customers(id), PRIMARY KEY(source,external_id))")
             db.execute("CREATE TABLE document_imports(document_id INTEGER PRIMARY KEY REFERENCES documents(id), batch_id TEXT NOT NULL REFERENCES import_batches(id), fingerprint TEXT NOT NULL, original_status TEXT NOT NULL, pdf BLOB NOT NULL)")
-        db.execute('PRAGMA user_version=2')
+        if version < 3:
+            db.execute("CREATE TABLE import_uploads(id TEXT PRIMARY KEY, created REAL NOT NULL, filename TEXT NOT NULL, total_size INTEGER NOT NULL, received_size INTEGER NOT NULL DEFAULT 0, next_part INTEGER NOT NULL DEFAULT 0, batch_id TEXT REFERENCES import_batches(id))")
+            db.execute("CREATE TABLE import_chunks(upload_id TEXT NOT NULL REFERENCES import_uploads(id) ON DELETE CASCADE, part INTEGER NOT NULL, digest TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(upload_id,part))")
+        db.execute('PRAGMA user_version=3')
 
 
 def backup(source, destination):
