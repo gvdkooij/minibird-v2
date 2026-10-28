@@ -1,6 +1,18 @@
 # MiniBird v2
 Nederlandstalige facturatie voor één bedrijf en één beheerder. Python 3.12+, FastAPI, SQLite en server-rendered HTML; geen Node of Docker nodig. Gericht op Ubuntu 24.04 met 1 vCPU en 1 GB RAM.
 
+## Gratis uitproberen in GitHub Codespaces
+
+[Open MiniBird in Codespaces](https://codespaces.new/gvdkooij/minibird-v2?ref=codespaces-setup)
+
+1. Log in bij GitHub, kies branch **codespaces-setup** en maak de Codespace aan. Gebruik de standaardmachine met 2 cores. GitHub toont de beschikbare gratis quota en eventuele kosten; je hoeft voor deze app geen betaalde opties te kiezen.
+2. Wacht tot de installatie is afgerond. De app start automatisch. Open in het tabblad **Ports** de browserlink van poort **8000**. Kies **Open in Browser**, niet de ingesloten editorpreview. Laat de zichtbaarheid op **Private**; GitHub vraagt om je eigen login. Er wordt geen publiek toegankelijke demo gemaakt.
+3. Maak in MiniBird je eigen beheerder aan en vul daarna je bedrijfsgegevens en een testklant in. Gebruik fictieve gegevens om uit te proberen. Je kiest zelf je wachtwoord; er zijn geen standaardinloggegevens.
+
+De browserlink gebruikt HTTPS en MiniBird gebruikt Secure-cookies. De interne server blijft op 127.0.0.1 draaien. Database en sessiesleutel staan in de genegeerde map `data/` onder de checkout. Ze blijven behouden bij stoppen/starten en een normale containerrebuild van dezelfde Codespace. **Bij verwijderen van de Codespace verdwijnen ze**: maak vooraf een backup en download die samen met de sleutel als je gegevens wilt bewaren. Zet geheimen of financiële gegevens nooit in Git.
+
+Na een herstart start de app opnieuw automatisch. Indien nodig: `.venv/bin/python .devcontainer/start.py`. Startfouten staan in `data/codespaces.log`. Sluit na het testen de Codespace via GitHub met **Stop codespace**, zodat geen onnodige rekentijd wordt gebruikt. Een Codespace kan bij inactiviteit vanzelf stoppen; dit is een proefomgeving, geen permanente hosting. Gratis gebruik is afhankelijk van je GitHub-account en resterende quota.
+
 ## Snel lokaal starten
 ```sh
 python3 -m venv .venv
