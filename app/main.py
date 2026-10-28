@@ -18,7 +18,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from reportlab.pdfgen import canvas
@@ -66,6 +66,8 @@ def create_app(database=None, secret=None, secure=None):
 
     @app.exception_handler(HTTPException)
     async def error(request, exc):
+        if 'application/json' in request.headers.get('accept',''):
+            return JSONResponse({'detail':exc.detail},status_code=exc.status_code)
         if exc.status_code==401: return go('/login')
         return HTMLResponse(templates.env.get_template('error.html').render(csrf=request.session.get('csrf',''),logged=bool(request.session.get('admin')),message=exc.detail,code=exc.status_code),status_code=exc.status_code)
 

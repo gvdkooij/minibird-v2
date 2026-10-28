@@ -1,3 +1,41 @@
+// Keep imports independent of proxy handling of a separate token endpoint.
+// The authenticated import page already contains a CSRF token for this session.
+async function importResponseError(response, fallback) {
+  const location = new URL(response.url, window.location.href);
+  if (location.origin !== window.location.origin) {
+    return new Error('GitHub heeft de verbinding naar een andere pagina omgeleid. Open MiniBird opnieuw via de browserlink van je Codespace.');
+  }
+  if (response.status === 401 || location.pathname === '/login') {
+    return new Error('Je bent niet meer ingelogd in MiniBird. Log opnieuw in om verder te gaan.');
+  }
+  let message;
+  if ((response.headers.get('content-type') || '').includes('application/json')) {
+    const body = await response.json().catch(() => ({}));
+    if (typeof body.detail === 'string') message = body.detail;
+  } else {
+    const html = new DOMParser().parseFromString(await response.text(), 'text/html');
+    message = html.querySelector('[role=alert]')?.textContent;
+  }
+  return new Error(`${message || fallback} (HTTP ${response.status}). Je gekozen bestand blijft geselecteerd.`);
+}
+
+async function currentImportCsrf() {
+  let response;
+  try {
+    response = await fetch('/imports', {credentials: 'same-origin', cache: 'no-store', headers: {'Accept': 'text/html'}});
+  } catch {
+    throw new Error('De importpagina is niet bereikbaar. Probeer opnieuw zodra de verbinding is hersteld.');
+  }
+  const location = new URL(response.url, window.location.href);
+  if (!response.ok || location.origin !== window.location.origin || location.pathname === '/login') {
+    throw await importResponseError(response, 'De importpagina kan niet worden gecontroleerd');
+  }
+  const html = new DOMParser().parseFromString(await response.text(), 'text/html');
+  const token = html.querySelector('#import-form input[name=csrf]')?.value;
+  if (!token) throw new Error('De server leverde geen geldige importpagina. Dit is geen melding dat je sessie verlopen is.');
+  return token;
+}
+
 const form = document.getElementById('import-form');
 if (form) {
   const status = document.getElementById('upload-status');
@@ -5,30 +43,27 @@ if (form) {
   const button = form.querySelector('button[type=submit]');
   const input = form.querySelector('input[type=file]');
   let csrf = form.querySelector('input[name=csrf]').value;
-  async function freshToken() {
-    const response = await fetch('/imports/token', {credentials: 'same-origin', cache: 'no-store'});
-    if (!response.ok || response.redirected) throw new Error('Je sessie is verlopen. Log opnieuw in en kies het bestand nogmaals.');
-    return (await response.json()).csrf;
-  }
   async function api(url, options = {}, refreshed = false) {
     let response;
     try {
-      response = await fetch(url, {...options, credentials: 'same-origin', headers: {'X-CSRF-Token': csrf, ...options.headers}});
+      response = await fetch(url, {...options, credentials: 'same-origin', headers: {'Accept': 'application/json', 'X-CSRF-Token': csrf, ...options.headers}});
     } catch {
       throw new Error('De verbinding is onderbroken. Kies Bestand controleren om opnieuw te proberen.');
     }
-    if (response.redirected && new URL(response.url).pathname === '/login') {
-      throw new Error('Je sessie is verlopen. Log opnieuw in en kies het bestand nogmaals.');
+    const location = new URL(response.url, window.location.href);
+    if (location.origin !== window.location.origin || location.pathname === '/login' || response.status === 401) {
+      throw await importResponseError(response, 'Import niet bereikbaar');
     }
     if (!response.ok) {
       if (response.status === 413) throw new Error('De uploadlimiet is bereikt. Kies een bestand van maximaal 50 MB.');
       if (response.status === 403 && !refreshed) {
-        csrf = await freshToken();
+        csrf = await currentImportCsrf();
         return api(url, options, true);
       }
-      if (response.status === 403) throw new Error('Je beveiligingscode kon niet worden vernieuwd. Vernieuw de pagina.');
-      const html = new DOMParser().parseFromString(await response.text(), 'text/html');
-      throw new Error(html.querySelector('[role=alert]')?.textContent || `Upload mislukt (${response.status}). Probeer opnieuw.`);
+      throw await importResponseError(response, 'De importaanvraag is geweigerd');
+    }
+    if (!(response.headers.get('content-type') || '').includes('application/json')) {
+      throw new Error('De upload kreeg een onverwachte pagina terug. Dit is geen bevestiging dat je sessie verlopen is. Je bestand blijft geselecteerd.');
     }
     return response.json();
   }
@@ -49,7 +84,6 @@ if (form) {
     status.textContent = 'Upload voorbereiden…';
     let upload;
     try {
-      csrf = await freshToken();
       upload = await api('/imports/uploads/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({filename: file.name, size: file.size})});
       for (let offset = 0, part = 0; offset < file.size; offset += upload.chunk_size, part++) {
         const result = await api(`/imports/uploads/${upload.id}/chunks/${part}`, {method: 'PUT', headers: {'Content-Type': 'application/octet-stream'}, body: file.slice(offset, offset + upload.chunk_size)});
@@ -62,7 +96,7 @@ if (form) {
     } catch (error) {
       status.textContent = error.message;
       if (upload) {
-        try { await api(`/imports/uploads/${upload.id}`, {method: 'DELETE'}); } catch { /* Expired uploads are also removed server-side. */ }
+        try { await api(`/imports/uploads/${upload.id}`, {method: 'DELETE'}); } catch { /* Stale uploads are also removed server-side. */ }
       }
       button.disabled = false;
       input.disabled = false;
@@ -78,9 +112,7 @@ for (const action of document.querySelectorAll('form[data-current-session]')) {
     const status = document.getElementById('confirm-status');
     button.disabled = true;
     try {
-      const response = await fetch('/imports/token', {credentials: 'same-origin', cache: 'no-store'});
-      if (!response.ok || response.redirected) throw new Error('Je sessie is verlopen. Log opnieuw in om verder te gaan.');
-      action.querySelector('input[name=csrf]').value = (await response.json()).csrf;
+      action.querySelector('input[name=csrf]').value = await currentImportCsrf();
       HTMLFormElement.prototype.submit.call(action);
     } catch (error) {
       status.textContent = error.message;

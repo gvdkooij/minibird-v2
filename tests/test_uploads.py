@@ -161,3 +161,14 @@ def test_legacy_import_still_recognized_after_tax_label_upgrade(ctx):
     preview=pieces(c,raw,'archive.zip')
     html=c.get(preview).text
     assert 'Al aanwezig' in html and 'Het nummer bestaat met andere gegevens' not in html
+
+
+def test_json_api_reports_auth_failure_without_html_redirect(ctx):
+    c,db=ctx
+    response=c.post('/imports/uploads/start',json={'filename':'x.vcf','size':1},headers={'Accept':'application/json'},follow_redirects=False)
+    assert response.status_code==401
+    assert response.json()=={'detail':'Log eerst in'}
+    setup(c)
+    response=c.post('/imports/uploads/start',json={'filename':'x.vcf','size':1},headers={'Accept':'application/json'},follow_redirects=False)
+    assert response.status_code==403
+    assert 'beveiligingscode' in response.json()['detail']

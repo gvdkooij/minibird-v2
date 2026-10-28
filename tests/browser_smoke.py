@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import urllib.request
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, expect
 
 root=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(root))
@@ -77,6 +77,21 @@ with tempfile.TemporaryDirectory() as tmp:
             page.get_by_role('button',name='Inloggen',exact=True).click()
             assert 'Goed overzicht' in page.inner_text('main')
             assert not errors,errors
+            # Prove that an unavailable legacy token URL does not masquerade
+            # as an expired session. Includes stale forms and confirmation below.
+            token_requests=[]
+            def unavailable_token(route):
+                token_requests.append(route.request.url)
+                route.fulfill(status=404,body='Proxy route unavailable')
+            page.route('**/imports/token',unavailable_token)
+            proxy_returns=[]
+            def redirect_import_fetch(route):
+                if route.request.resource_type=='fetch' and not proxy_returns:
+                    proxy_returns.append(True)
+                    route.fulfill(status=302,headers={'Location':'/imports?proxy-return=1'})
+                else:
+                    route.continue_()
+            page.route('**/imports',redirect_import_fetch)
             # Simulate a cross-site GitHub authentication return. Lax cookies
             # must keep the authenticated session for the top-level GET.
             page.goto(url.replace('127.0.0.1','localhost')+'/health')
@@ -115,6 +130,35 @@ with tempfile.TemporaryDirectory() as tmp:
                 page.get_by_role('link',name='PDF downloaden').click()
             assert Path(imported_pdf.value.path()).read_bytes().startswith(b'%PDF-')
             assert not errors,errors
+            assert not token_requests, 'Upload must not depend on /imports/token'
+            assert proxy_returns, 'A successful same-origin redirect must be accepted'
+            page.get_by_role('link',name='Importeren',exact=True).click()
+            page.get_by_label('Exportbestand').set_input_files({'name':'contacts.vcf','mimeType':'text/vcard','buffer':VCF})
+            def unavailable_api(route):
+                route.fulfill(status=503,body='Proxy unavailable')
+            page.route('**/imports/uploads/start',unavailable_api)
+            page.get_by_role('button',name='Bestand controleren').click()
+            expect(page.locator('#upload-status')).to_contain_text('HTTP 503')
+            assert 'niet meer ingelogd' not in page.locator('#upload-status').inner_text()
+            assert page.get_by_label('Exportbestand').evaluate('node=>node.files.length')==1
+            expect(page.get_by_role('button',name='Bestand controleren')).to_be_enabled()
+            page.unroute('**/imports/uploads/start',unavailable_api)
+            forbidden=[]
+            def forbidden_api(route):
+                forbidden.append(True)
+                route.fulfill(status=403,body='Proxy denied access')
+            page.route('**/imports/uploads/start',forbidden_api)
+            page.get_by_role('button',name='Bestand controleren').click()
+            expect(page.locator('#upload-status')).to_contain_text('HTTP 403')
+            assert len(forbidden)==2, 'A forbidden request gets at most one CSRF refresh retry'
+            assert 'niet meer ingelogd' not in page.locator('#upload-status').inner_text()
+            page.unroute('**/imports/uploads/start',forbidden_api)
+            def unauthenticated_api(route):
+                route.fulfill(status=401,content_type='application/json',body='{"detail":"Log eerst in"}')
+            page.route('**/imports/uploads/start',unauthenticated_api)
+            page.get_by_role('button',name='Bestand controleren').click()
+            expect(page.locator('#upload-status')).to_contain_text('niet meer ingelogd')
+            page.unroute('**/imports/uploads/start',unauthenticated_api)
             browser.close()
         print('Browser smoke: setup, settings, customer, multi-line quote, conversion, PDF, payment, responsive dashboard, logout/login, vCard/ZIP import, cross-site session, refreshed CSRF and original PDF PASSED')
     finally:
